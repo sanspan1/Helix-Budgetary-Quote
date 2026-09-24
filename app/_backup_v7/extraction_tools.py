@@ -64,7 +64,7 @@ def _parse_quote_date(cleaned_date_str: str):
     """Parses a 'DD-MON-YYYY' date (the quote PDF's format) into a
     datetime.date. Expects _clean_pdf_text has already been applied."""
     from datetime import date
-    m = re.match(r"(\d{1,2})-([A-Za-z]{3})-(\d{4})", re.sub(r"\s+", "", cleaned_date_str))
+    m = re.match(r"(\d{1,2})-([A-Za-z]{3})-(\d{4})", cleaned_date_str.strip())
     if not m:
         raise ValueError(f"Could not parse quote date {cleaned_date_str!r} as DD-MON-YYYY.")
     day, mon, year = m.groups()
@@ -108,7 +108,7 @@ def extract_quote_pdf(pdf_path: str) -> list[dict]:
     row_pattern = re.compile(
         r"([A-Za-z][A-Za-z0-9\-\s/]+?)\s*"
         r"BMC\s*\n?\s*Continuous\s*\n?\s*Support\s*"
-        r"(\d{1,2}\s*-\s*[A-Za-z]{3}\s*-\s*\d{4})\s*to\s*(\d{1,2}\s*-\s*[A-Za-z]{3}\s*-\s*\d{4})\s*"
+        r"(\d{1,2}-[A-Za-z]{3}-\d{4})\s*to\s*(\d{1,2}-[A-Za-z]{3}-\s*\n?\s*\d{4})\s*"
         r"per\s+([a-zA-Z0-9\-\s]+?)\s*"
         r"([\d,]+)\s*"
         r"USD\s*([\d,.]+?)\s*"
@@ -412,7 +412,7 @@ def get_valid_customer_tier_columns() -> list[str]:
     return [c for c in fieldnames[1:] if c]
 
 
-def get_customer_tier(account_csn: str) -> dict:
+def get_customer_tier(account_csn) -> dict:
     """Looks up account_csn in account_csn_tier_mapping.csv, then maps
     the raw 'Tier Global Helix' value to a real channel_discount_table.csv
     column via CONFIRMED_TIER_MAPPING. Only confirmed mappings are
@@ -472,116 +472,4 @@ def get_support_rate(support_tier: str) -> dict:
                       "support_rate_table.csv. Confirm the correct rate with "
                       "the user before computing this line.",
         }
-    raw_rate = match.get("Support Rate")
-    if raw_rate in (None, ""):
-        return {
-            "status": "needs_confirmation",
-            "reason": f"support_tier={support_tier!r} has no 'Support Rate' value in "
-                      "support_rate_table.csv. Confirm the rate with the user.",
-        }
-    return {"status": "resolved", "support_rate": float(raw_rate)}
-
-
-# ---------------------------------------------------------------------
-# Resolution -> calculator inputs
-# ---------------------------------------------------------------------
-
-RESOLUTION_FLAT = "flat"
-RESOLUTION_GROWTH = "growth"
-RESOLUTION_DECREASE = "decrease"
-RESOLUTION_EXCLUDE = "exclude"
-
-
-def build_renewal_line_inputs(match_result: dict, resolutions: dict,
-                                new_term_months_override=None,
-                                orig_term_months_override=None,
-                                perpetual_support_rate_override=None) -> dict:
-    """Turns the stored extract_and_match_quote() result plus the user's
-    confirmations into compute_renewal_quote() line inputs. All numbers
-    come from the stored UFR/PDF data, never from the LLM.
-
-    resolutions: {normalized product name: "flat"|"growth"|"decrease"|"exclude"}
-        Needed only for ambiguous lines.
-
-    Returns {"line_inputs": [...], "pending": [...], "blocked": [...],
-             "start_date", "end_date"}. Compute only when pending and
-    blocked are both empty.
-    """
-    line_inputs, pending, blocked = [], [], []
-    starts, ends = [], []
-
-    for line in match_result["lines"]:
-        product = line["product"]
-        if line.get("scope_flag") == "possible_new_business":
-            blocked.append({"product": product, "reason": line["reason"]})
-            continue
-
-        ufr = line["ufr"]
-        existing_qty = _to_number(ufr["existing_qty"])
-
-        if line["status"] == "resolved":
-            row = line["rows"][0]
-            code, proposed_qty = row["code"], row["proposed_qty"]
-        else:
-            choice = resolutions.get(_normalize(product))
-            pdf_qty = _to_number(line.get("pdf_qty"))
-            if choice == RESOLUTION_FLAT:
-                code, proposed_qty = "", existing_qty
-            elif choice == RESOLUTION_GROWTH:
-                code, proposed_qty = "a", existing_qty + pdf_qty
-            elif choice == RESOLUTION_DECREASE:
-                code, proposed_qty = "d", pdf_qty
-            elif choice == RESOLUTION_EXCLUDE:
-                code, proposed_qty = "x", 0
-            else:
-                pending.append({"product": product,
-                                "ambiguity_type": line.get("ambiguity_type"),
-                                "reason": line.get("reason")})
-                continue
-
-        license_type = (ufr.get("service_type") or "").strip()
-        support_rate = None
-        if license_type != "OPS" and code not in ("d", "x"):
-            lookup = get_support_rate(ufr.get("support_tier") or "")
-            if lookup["status"] == "resolved":
-                support_rate = lookup["support_rate"]
-            elif perpetual_support_rate_override is not None:
-                support_rate = float(perpetual_support_rate_override)
-            else:
-                pending.append({"product": product, "ambiguity_type": "support_rate",
-                                "reason": lookup["reason"]})
-                continue
-
-        new_term = new_term_months_override or line.get("new_term_months")
-        orig_term = orig_term_months_override or ufr.get("orig_term_months")
-        if not new_term or not orig_term:
-            pending.append({"product": product, "ambiguity_type": "term",
-                            "reason": "Missing new or original term months."})
-            continue
-
-        if line.get("term_start"):
-            starts.append(line["term_start"])
-        if line.get("term_end"):
-            ends.append(line["term_end"])
-
-        line_inputs.append({
-            "product_name": ufr["product"],
-            "license_type": license_type,
-            "existing_qty": existing_qty,
-            "proposed_qty": proposed_qty,
-            "code": code,
-            "orig_brv_acv": ufr["brv_acv"],
-            "orig_trv_acv": ufr["trv_acv"],
-            "orig_erv_acv": ufr["erv_acv"],
-            "orig_term_months": orig_term,
-            "new_term_months": new_term,
-            "term_end": line.get("term_end"),
-            "support_rate": support_rate,
-            "account_csn": ufr.get("account_csn"),
-        })
-
-    return {
-        "line_inputs": line_inputs, "pending": pending, "blocked": blocked,
-        "start_date": min(starts) if starts else None,
-        "end_date": max(ends) if ends else None,
-    }
+    return {"status": "resolved", "support_rate": _to_number(match.get("Rate"))}
